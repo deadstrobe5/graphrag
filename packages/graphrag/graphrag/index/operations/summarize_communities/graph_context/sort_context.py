@@ -82,10 +82,11 @@ def sort_context(
     # Sort edges by degree (desc) and ID (asc)
     edges.sort(key=lambda x: (-x.get(edge_degree_column, 0), x.get(edge_id_column, "")))
 
-    # Deduplicate and build context incrementally
+    # Deduplicate in priority order. Each edge can only add items, so the
+    # context after edge i is described by the prefix lengths of the three lists.
     edge_ids, nodes_ids, claims_ids = set(), set(), set()
     sorted_edges, sorted_nodes, sorted_claims = [], [], []
-    context_string = ""
+    prefix_sizes: list[tuple[int, int, int]] = []
 
     for edge in edges:
         source, target = edge[edge_source_column], edge[edge_target_column]
@@ -109,21 +110,52 @@ def sort_context(
             edge_ids.add(edge[schemas.SHORT_ID])
             sorted_edges.append(edge)
 
-        # Generate new context string
-        new_context_string = _get_context_string(
+        prefix_sizes.append((len(sorted_nodes), len(sorted_edges), len(sorted_claims)))
+
+    if not max_context_tokens or not prefix_sizes:
+        return _get_context_string(
             sorted_nodes, sorted_edges, sorted_claims, sub_community_reports
         )
-        if (
-            max_context_tokens
-            and tokenizer.num_tokens(new_context_string) > max_context_tokens
-        ):
-            break
-        context_string = new_context_string
 
-    # Return the final context string
-    return context_string or _get_context_string(
-        sorted_nodes, sorted_edges, sorted_claims, sub_community_reports
-    )
+    rendered: dict[int, str] = {}
+
+    def _context_at(i: int) -> str:
+        if i not in rendered:
+            n_nodes, n_edges, n_claims = prefix_sizes[i]
+            rendered[i] = _get_context_string(
+                sorted_nodes[:n_nodes],
+                sorted_edges[:n_edges],
+                sorted_claims[:n_claims],
+                sub_community_reports,
+            )
+        return rendered[i]
+
+    def _num_tokens(i: int) -> int:
+        return tokenizer.num_tokens(_context_at(i))
+
+    # The context only grows as edges are added, so instead of re-rendering
+    # and re-tokenizing it after every edge, search for the first edge that
+    # pushes it over the limit. The first probe is sized so that it usually
+    # covers the whole community (an edge rarely adds fewer than ~20 tokens),
+    # then the probe doubles until it exceeds the limit and a binary search
+    # narrows down the last interval.
+    last = len(prefix_sizes) - 1
+    lo, hi = 0, min(max(max_context_tokens // 20, 0), last)
+    while _num_tokens(hi) <= max_context_tokens:
+        if hi == last:
+            return _context_at(last)
+        lo = hi + 1
+        hi = min(2 * hi + 1, last)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _num_tokens(mid) > max_context_tokens:
+            hi = mid
+        else:
+            lo = mid + 1
+
+    # Keep the context from before the first edge that exceeded the limit. If
+    # even the first edge exceeds it, return that context anyway.
+    return _context_at(max(lo - 1, 0))
 
 
 def parallel_sort_context_batch(

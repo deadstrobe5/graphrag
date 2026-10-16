@@ -1,0 +1,4 @@
+{
+  "type": "patch",
+  "description": "Speed up community report context building by searching for the token limit instead of re-rendering the context after every edge."
+}
